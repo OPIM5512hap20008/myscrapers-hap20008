@@ -111,43 +111,47 @@ def _parse_run_id_as_iso(run_id: str) -> str:
 def parse_listing(text: str) -> dict:
     d = {}
 
-    m = PRICE_RE.search(text)
-    if m:
+    # --- Existing fields ---
+    # Price
+    m_price = re.search(r"\$\s?([0-9,]+)", text)
+    if m_price:
         try:
-            d["price"] = int(m.group(1).replace(",", ""))
+            d["price"] = int(m_price.group(1).replace(",", ""))
         except ValueError:
             pass
 
-    y = YEAR_RE.search(text)
-    if y:
+    # Year
+    m_year = re.search(r"\b(19|20)\d{2}\b", text)
+    year_val = None
+    if m_year:
         try:
-            d["year"] = int(y.group(0))
+            year_val = int(m_year.group(0))
+            d["year"] = year_val
         except ValueError:
             pass
 
-    mm = MAKE_MODEL_RE.search(text)
-    if mm:
-        d["make"] = mm.group(1)
-        d["model"] = mm.group(2)
+    # Make & Model
+    m_mm = re.search(r"\b([A-Z][a-z]+)\s+([A-Z][A-Za-z0-9]+)", text)
+    if m_mm:
+        d["make"] = m_mm.group(1)
+        d["model"] = m_mm.group(2)
 
-    # mileage variants
-    mi = None
-    m1 = re.search(r"(?:mileage|odometer)\s*[:\-]?\s*([\d,]+)", text, re.I)
-    if m1:
-        try: mi = int(m1.group(1).replace(",", ""))
-        except ValueError: mi = None
-    if mi is None:
-        m2 = re.search(r"(\d+(?:\.\d+)?)\s*k\s*(?:mi|mile|miles)\b", text, re.I)
-        if m2:
-            try: mi = int(float(m2.group(1)) * 1000)
-            except ValueError: mi = None
-    if mi is None:
-        m3 = re.search(r"(\d{1,3}(?:[,\d]{3})*)\s*(?:mi|mile|miles)\b", text, re.I)
-        if m3:
-            try: mi = int(re.sub(r"[^\d]", "", m3.group(1)))
-            except ValueError: mi = None
-    if mi is not None:
-        d["mileage"] = mi
+    # Mileage
+    mileage_val = None
+    m_mi = re.search(r"(?:mileage|odometer)\s*[:\-]?\s*([\d,]+)", text, re.I)
+    if m_mi:
+        try:
+            mileage_val = int(m_mi.group(1).replace(",", ""))
+            d["mileage"] = mileage_val
+        except ValueError:
+            pass
+
+    # --- NEW FIELDS ---
+    if year_val is not None:
+        d["is_old_car"] = True if year_val < 2010 else False
+
+    if mileage_val is not None:
+        d["high_mileage_flag"] = True if mileage_val > 150_000 else False
 
     return d
 
