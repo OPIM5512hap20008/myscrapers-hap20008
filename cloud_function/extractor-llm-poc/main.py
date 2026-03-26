@@ -162,16 +162,38 @@ def _vertex_extract_fields(raw_text: str) -> dict:
 
     # Strict JSON schema - FIX: Removed "additionalProperties": False
     schema = {
-        "type": "object",
-        "properties": {
-            "price": {"type": "integer", "nullable": True},
-            "year": {"type": "integer", "nullable": True},
-            "make": {"type": "string", "nullable": True},
-            "model": {"type": "string", "nullable": True},
-            "mileage": {"type": "integer", "nullable": True},
+    "type": "object",
+    "properties": {
+        "price":         {"type": "integer", "nullable": True},
+        "year":          {"type": "integer", "nullable": True},
+        "make":          {"type": "string",  "nullable": True},
+        "model":         {"type": "string",  "nullable": True},
+        "mileage":       {"type": "integer", "nullable": True},
+        # New optional fields
+        "transmission":  {"type": "string",  "nullable": True},
+        "body_type":     {"type": "string",  "nullable": True},
+        "fuel":          {"type": "string",  "nullable": True},
+        "color":         {"type": "string",  "nullable": True},
+        "title_status":  {"type": "string",  "nullable": True},
+        "condition":     {"type": "string",  "nullable": True},
+        "location": {
+            "type": "object",
+            "properties": {
+                "city":  {"type": "string", "nullable": True},
+                "state": {"type": "string", "nullable": True},
+                "zip":   {"type": "string", "nullable": True}
+            },
+            "required": ["city", "state"],  # optional: zip can be missing
+            "nullable": True
         },
-        "required": ["price", "year", "make", "model", "mileage"]
-    }
+        # Example additional fields you might want
+        "seller_type":   {"type": "string", "nullable": True},  # dealer/private
+        "doors":         {"type": "integer", "nullable": True},
+        "drivetrain":    {"type": "string", "nullable": True},
+        "engine":        {"type": "string", "nullable": True}
+    },
+    "required": ["price", "year", "make", "model", "mileage"]  # keep core required
+}
 
     # System instruction (will be prepended to the prompt)
     sys_instr = (
