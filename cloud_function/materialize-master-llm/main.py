@@ -30,7 +30,9 @@ CSV_COLUMNS = [
     "price", "year", "make", "model", "mileage",
     "source_txt",
     "is_old_car",          # new field from extractor
-    "high_mileage_flag"    # new field from extractor
+    "high_mileage_flag",   # new field from extractor
+    "transmission",
+    "fuel"
 ]
 
 def _list_run_ids(bucket: str, structured_prefix: str) -> list[str]:
