@@ -156,7 +156,7 @@ def _safe_int(x):
 # -------------------- VERTEX AI CALL --------------------
 def _vertex_extract_fields(raw_text: str) -> dict:
     """
-    Ask Gemini to return JSON with exactly: price, year, make, model, mileage.
+    Ask Gemini to return JSON with exactly: price, year, make, model, mileage, and transmission.
     """
     model = _get_vertex_model()
 
@@ -164,35 +164,18 @@ def _vertex_extract_fields(raw_text: str) -> dict:
     schema = {
     "type": "object",
     "properties": {
-        "price":         {"type": "integer", "nullable": True},
-        "year":          {"type": "integer", "nullable": True},
-        "make":          {"type": "string",  "nullable": True},
-        "model":         {"type": "string",  "nullable": True},
-        "mileage":       {"type": "integer", "nullable": True},
-        # New optional fields
-        "transmission":  {"type": "string",  "nullable": True},
-        "body_type":     {"type": "string",  "nullable": True},
-        "fuel":          {"type": "string",  "nullable": True},
-        "color":         {"type": "string",  "nullable": True},
-        "title_status":  {"type": "string",  "nullable": True},
-        "condition":     {"type": "string",  "nullable": True},
-        "location": {
-            "type": "object",
-            "properties": {
-                "city":  {"type": "string", "nullable": True},
-                "state": {"type": "string", "nullable": True},
-                "zip":   {"type": "string", "nullable": True}
-            },
-            "required": ["city", "state"],  # optional: zip can be missing
-            "nullable": True
-        },
-        # Example additional fields you might want
-        "seller_type":   {"type": "string", "nullable": True},  # dealer/private
-        "doors":         {"type": "integer", "nullable": True},
-        "drivetrain":    {"type": "string", "nullable": True},
-        "engine":        {"type": "string", "nullable": True}
+        # Core required fields
+        "price":   {"type": "integer", "nullable": True},
+        "year":    {"type": "integer", "nullable": True},
+        "make":    {"type": "string",  "nullable": True},
+        "model":   {"type": "string",  "nullable": True},
+        "mileage": {"type": "integer", "nullable": True},
+
+        # Optional LLM fields
+        "transmission": {"type": "string", "nullable": True},
+        "fuel":         {"type": "string", "nullable": True}
     },
-    "required": ["price", "year", "make", "model", "mileage"]  # keep core required
+    "required": ["price", "year", "make", "model", "mileage", "transmission", "fuel"]
 }
 
     # System instruction (will be prepended to the prompt)
@@ -201,6 +184,7 @@ def _vertex_extract_fields(raw_text: str) -> dict:
         "Return a strict JSON object that conforms to the provided schema. "
         "If a value is not present, use null. "
         "Rules: integers for price/year/mileage; price in USD; mileage in miles; "
+        "The transmission can be automatic or manual, or if not listed, write null."
         "do not infer values not explicitly present; do not add extra keys."
     )
 
