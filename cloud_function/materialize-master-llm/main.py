@@ -75,17 +75,22 @@ def _jsonl_records_for_run(bucket: str, structured_prefix: str, run_id: str):
         if not blob.name.endswith(".jsonl"):
             continue
 
-        data = blob.download_as_text()
-        line = data.strip()
-        if not line:
-            continue
-
         try:
-            rec = json.loads(line)
-            rec.setdefault("run_id", run_id)
-            yield rec
+            data = blob.download_as_text()
         except Exception:
             continue
+
+        for line in data.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+
+            try:
+                rec = json.loads(line)
+                rec.setdefault("run_id", run_id)
+                yield rec
+            except Exception:
+                continue
 
 
 def _run_id_to_dt(rid: str) -> datetime:
@@ -96,7 +101,7 @@ def _run_id_to_dt(rid: str) -> datetime:
             return datetime.strptime(rid, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
     except Exception:
         pass
-    return datetime.now(timezone.utc)
+    return datetime.min.replace(tzinfo=timezone.utc)
 
 
 def _open_gcs_text_writer(bucket: str, key: str):
@@ -112,22 +117,22 @@ def _derive_flags(row: Dict) -> Dict:
     year = row.get("year")
     mileage = row.get("mileage")
 
-    # is_old_car: True if >= 10 years old
-    if year is not None:
-        try:
+    # is_old_car
+    try:
+        if year is not None:
             row["is_old_car"] = (current_year - int(year)) >= 10
-        except Exception:
+        else:
             row["is_old_car"] = None
-    else:
+    except Exception:
         row["is_old_car"] = None
 
-    # high_mileage_flag: True if >= 120,000 miles
-    if mileage is not None:
-        try:
+    # high_mileage_flag
+    try:
+        if mileage is not None:
             row["high_mileage_flag"] = int(mileage) >= 120000
-        except Exception:
+        else:
             row["high_mileage_flag"] = None
-    else:
+    except Exception:
         row["high_mileage_flag"] = None
 
     return row
@@ -142,7 +147,14 @@ def _write_csv(records: Iterable[Dict], dest_key: str) -> int:
         for rec in records:
             row = {c: rec.get(c, None) for c in CSV_COLUMNS}
 
-            # Derive missing fields
+            # Ensure numeric fields are properly cast where possible
+            for field in ["year", "mileage"]:
+                if row.get(field) is not None:
+                    try:
+                        row[field] = int(row[field])
+                    except Exception:
+                        pass
+
             row = _derive_flags(row)
 
             w.writerow(row)
@@ -152,22 +164,6 @@ def _write_csv(records: Iterable[Dict], dest_key: str) -> int:
 
 
 # -------------------- MAIN MATERIALIZE --------------------
-def _list_run_ids(bucket: str, structured_prefix: str) -> list[str]:
-    it = storage_client.list_blobs(bucket, prefix=f"{structured_prefix}/", delimiter="/")
-    for _ in it:
-        pass
-
-    run_ids = []
-    for p in getattr(it, "prefixes", []):
-        tail = p.rstrip("/").split("/")[-1]
-        if tail.startswith("run_id="):
-            rid = tail.split("run_id=", 1)[1]
-            if RUN_ID_ISO_RE.match(rid) or RUN_ID_PLAIN_RE.match(rid):
-                run_ids.append(rid)
-
-    return sorted(run_ids)
-
-
 def materialize_http(request: Request):
     try:
         if not BUCKET_NAME:
@@ -191,10 +187,10 @@ def materialize_http(request: Request):
 
                 prev = latest_by_post.get(pid)
 
-                if prev is None or (
-                    _run_id_to_dt(rec.get("run_id", rid)) >
-                    _run_id_to_dt(prev.get("run_id", ""))
-                ):
+                rec_dt = _run_id_to_dt(rec.get("run_id", rid))
+                prev_dt = _run_id_to_dt(prev.get("run_id")) if prev else None
+
+                if prev is None or rec_dt > prev_dt:
                     latest_by_post[pid] = rec
 
         # Write output
