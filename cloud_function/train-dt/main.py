@@ -19,7 +19,6 @@ from sklearn.impute import SimpleImputer
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.model_selection import GridSearchCV
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-
 from sklearn.inspection import permutation_importance
 
 # ---- ENV ----
@@ -27,7 +26,6 @@ PROJECT_ID     = os.getenv("PROJECT_ID", "")
 GCS_BUCKET     = os.getenv("GCS_BUCKET", "")
 DATA_KEY       = os.getenv("DATA_KEY", "structured/datasets/listings_master_llm.csv")
 OUTPUT_PREFIX  = os.getenv("OUTPUT_PREFIX", "structured/outputs")
-TIMEZONE       = os.getenv("TIMEZONE", "America/New_York")
 
 logging.basicConfig(level="INFO")
 
@@ -48,6 +46,8 @@ def _write_json_to_gcs(client, bucket, key, obj):
 
 # -------------------- CLEANING --------------------
 def _clean_numeric(s: pd.Series) -> pd.Series:
+    if s is None:
+        return s
     s = s.astype(str).str.replace(r"[^\d.]+", "", regex=True).str.strip()
     return pd.to_numeric(s, errors="coerce")
 
@@ -63,6 +63,23 @@ def run_once():
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
+    # ---- Ensure expected columns exist (robust to schema changes) ----
+    expected_features = [
+        "make", "model",
+        "fuel", "transmission",
+        "color", "city", "state", "zip_code",
+        "year", "mileage"
+    ]
+
+    for col in expected_features:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    # ---- Clean numeric fields ----
+    df["price_num"] = _clean_numeric(df["price"])
+    df["year"] = _clean_numeric(df["year"])
+    df["mileage"] = _clean_numeric(df["mileage"])
+
     # ---- Time split ----
     df["scraped_at_dt"] = pd.to_datetime(df["scraped_at"], errors="coerce", utc=True)
     df["date"] = df["scraped_at_dt"].dt.date
@@ -76,11 +93,10 @@ def run_once():
     train_df = df[df["date"] < today].copy()
     test_df  = df[df["date"] == today].copy()
 
-    # ---- Target cleaning ----
-    df["price_num"] = _clean_numeric(df["price"])
+    # ---- Drop invalid targets ----
     train_df = train_df[train_df["price_num"].notna()]
 
-    # ---- Feature set (UPDATED) ----
+    # ---- Feature set ----
     cat_cols = [
         "make", "model",
         "fuel", "transmission",
@@ -89,12 +105,10 @@ def run_once():
 
     num_cols = ["year", "mileage"]
 
-    # Clean numerics
-    for col in num_cols:
-        if col in df.columns:
-            df[col] = _clean_numeric(df[col])
-
     features = cat_cols + num_cols
+
+    X_train = train_df[features]
+    y_train = train_df["price_num"]
 
     # ---- Preprocessing ----
     pre = ColumnTransformer(
@@ -114,7 +128,7 @@ def run_once():
         ("model", model)
     ])
 
-    # ---- Hyperparameter tuning (REQUIRED) ----
+    # ---- Hyperparameter tuning ----
     param_grid = {
         "model__max_depth": [5, 10, 15, None],
         "model__min_samples_leaf": [5, 10, 20],
@@ -128,14 +142,10 @@ def run_once():
         n_jobs=-1
     )
 
-    X_train = train_df[features]
-    y_train = train_df["price_num"]
-
     grid.fit(X_train, y_train)
 
     best_model = grid.best_estimator_
 
-    # ---- Evaluation on today ----
     results = {
         "status": "ok",
         "best_params": grid.best_params_,
@@ -143,21 +153,20 @@ def run_once():
         "feature_importance": None
     }
 
+    # ---- Evaluation on today ----
     if not test_df.empty:
-        X_test = test_df[features]
-        y_test = test_df["price_num"]
+        test_df = test_df[test_df["price_num"].notna()]
 
-        preds = best_model.predict(X_test)
+        if not test_df.empty:
+            X_test = test_df[features]
+            y_test = test_df["price_num"]
 
-        mask = y_test.notna()
-        if mask.any():
-            y_true = y_test[mask]
-            y_pred = preds[mask]
+            preds = best_model.predict(X_test)
 
-            mae = mean_absolute_error(y_true, y_pred)
-            rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-            mape = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
-            bias = np.mean(y_pred - y_true)
+            mae = mean_absolute_error(y_test, preds)
+            rmse = np.sqrt(mean_squared_error(y_test, preds))
+            mape = np.mean(np.abs((y_test - preds) / y_test)) * 100
+            bias = np.mean(preds - y_test)
 
             results["metrics"] = {
                 "MAE": float(mae),
@@ -166,24 +175,28 @@ def run_once():
                 "Bias": float(bias)
             }
 
-    # ---- Permutation Importance (REQUIRED) ----
-    perm = permutation_importance(
-        best_model,
-        X_train,
-        y_train,
-        n_repeats=5,
-        random_state=42,
-        n_jobs=-1
-    )
+    # ---- Permutation Importance ----
+    try:
+        perm = permutation_importance(
+            best_model,
+            X_train,
+            y_train,
+            n_repeats=5,
+            random_state=42,
+            n_jobs=-1
+        )
 
-    feature_names = best_model.named_steps["pre"].get_feature_names_out()
+        feature_names = best_model.named_steps["pre"].get_feature_names_out()
 
-    importance_df = pd.DataFrame({
-        "feature": feature_names,
-        "importance": perm.importances_mean
-    }).sort_values(by="importance", ascending=False)
+        importance_df = pd.DataFrame({
+            "feature": feature_names,
+            "importance": perm.importances_mean
+        }).sort_values(by="importance", ascending=False)
 
-    results["feature_importance"] = importance_df.head(50).to_dict(orient="records")
+        results["feature_importance"] = importance_df.head(50).to_dict(orient="records")
+
+    except Exception as e:
+        results["feature_importance_error"] = str(e)
 
     # ---- Save artifacts ----
     out_key = f"{OUTPUT_PREFIX}/training_results.json"
