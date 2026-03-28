@@ -1,125 +1,98 @@
 # main.py
-# Purpose: PoC LLM extractor that reads per-listing JSONL records,
+# Purpose: LLM extractor that reads per-listing JSONL records,
 # fetches original TXT, uses Vertex AI (Gemini) to extract structured fields,
-# and writes "<post_id>_llm.jsonl" to the 'jsonl_llm/' sub-directory.
+# and writes "<post_id>_llm.jsonl" to GCS.
 
 import os
 import re
 import json
 import logging
 import traceback
-import time
 from datetime import datetime, timezone
 
 from flask import Request, jsonify
-from google.api_core import retry as gax_retry
 from google.cloud import storage
 
 # Vertex AI
 import vertexai
 from vertexai.generative_models import GenerativeModel, GenerationConfig
-from google.api_core.exceptions import (
-    ResourceExhausted,
-    InternalServerError,
-    Aborted,
-    DeadlineExceeded
-)
 
 # -------------------- ENV --------------------
-PROJECT_ID        = os.getenv("PROJECT_ID", "")
-REGION            = os.getenv("REGION", "us-central1")
-BUCKET_NAME       = os.getenv("GCS_BUCKET", "")
+PROJECT_ID  = os.getenv("PROJECT_ID", "")
+REGION      = os.getenv("REGION", "us-central1")
+BUCKET_NAME = os.getenv("GCS_BUCKET", "")
+
 STRUCTURED_PREFIX = os.getenv("STRUCTURED_PREFIX", "structured")
-LLM_PROVIDER      = os.getenv("LLM_PROVIDER", "vertex").lower()
-LLM_MODEL         = os.getenv("LLM_MODEL", "gemini-2.5-flash")
-OVERWRITE_DEFAULT = os.getenv("OVERWRITE", "false").lower() == "true"
-MAX_FILES_DEFAULT = int(os.getenv("MAX_FILES", "0") or 0)
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash")
+
+# Controls whether existing outputs are overwritten
+OVERWRITE = os.getenv("OVERWRITE", "false").lower() == "true"
 
 storage_client = storage.Client()
-_CACHED_MODEL_OBJ = None
+_MODEL = None
 
-RUN_ID_ISO_RE  = re.compile(r"^\d{8}T\d{6}Z$")
+RUN_ID_ISO_RE = re.compile(r"^\d{8}T\d{6}Z$")
 RUN_ID_PLAIN_RE = re.compile(r"^\d{14}$")
 
-# -------------------- HELPERS --------------------
-def _get_vertex_model() -> GenerativeModel:
-    global _CACHED_MODEL_OBJ
-    if _CACHED_MODEL_OBJ is None:
+# -------------------- MODEL --------------------
+def get_model():
+    global _MODEL
+    if _MODEL is None:
         if not PROJECT_ID:
-            raise RuntimeError("PROJECT_ID is missing")
+            raise RuntimeError("Missing PROJECT_ID")
 
         vertexai.init(project=PROJECT_ID, location=REGION)
-        _CACHED_MODEL_OBJ = GenerativeModel(LLM_MODEL)
-        logging.info(f"Initialized model: {LLM_MODEL}")
-    return _CACHED_MODEL_OBJ
+        _MODEL = GenerativeModel(LLM_MODEL)
+        logging.info(f"Initialized Vertex model: {LLM_MODEL}")
+    return _MODEL
 
 
-def _list_structured_run_ids(bucket: str, structured_prefix: str) -> list[str]:
-    it = storage_client.list_blobs(bucket, prefix=f"{structured_prefix}/", delimiter="/")
-    for _ in it:
+# -------------------- STORAGE HELPERS --------------------
+def list_run_ids():
+    bucket = storage_client.bucket(BUCKET_NAME)
+    blobs = bucket.list_blobs(prefix=f"{STRUCTURED_PREFIX}/", delimiter="/")
+
+    for _ in blobs:
         pass
 
     runs = []
-    for pref in getattr(it, "prefixes", []):
-        tail = pref.rstrip("/").split("/")[-1]
+    for prefix in getattr(blobs, "prefixes", []):
+        tail = prefix.rstrip("/").split("/")[-1]
         if tail.startswith("run_id="):
-            cand = tail.split("run_id=", 1)[1]
-            if RUN_ID_ISO_RE.match(cand) or RUN_ID_PLAIN_RE.match(cand):
-                runs.append(cand)
+            run_id = tail.split("run_id=", 1)[1]
+            if RUN_ID_ISO_RE.match(run_id) or RUN_ID_PLAIN_RE.match(run_id):
+                runs.append(run_id)
+
     return sorted(runs)
 
 
-def _normalize_run_id_iso(run_id: str) -> str:
-    try:
-        if RUN_ID_ISO_RE.match(run_id):
-            dt = datetime.strptime(run_id, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
-        else:
-            dt = datetime.strptime(run_id, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
-        return dt.isoformat().replace("+00:00", "Z")
-    except Exception:
-        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _list_per_listing_jsonl_for_run(bucket: str, run_id: str) -> list[str]:
+def list_inputs(run_id):
     prefix = f"{STRUCTURED_PREFIX}/run_id={run_id}/jsonl/"
-    bucket_obj = storage_client.bucket(bucket)
+    bucket = storage_client.bucket(BUCKET_NAME)
 
-    names = []
-    for b in bucket_obj.list_blobs(prefix=prefix):
-        if b.name.endswith(".jsonl"):
-            names.append(b.name)
-    return names
+    return [b.name for b in bucket.list_blobs(prefix=prefix) if b.name.endswith(".jsonl")]
 
 
-def _download_text(blob_name: str) -> str:
+def download_text(blob_name):
     bucket = storage_client.bucket(BUCKET_NAME)
     return bucket.blob(blob_name).download_as_text()
 
 
-def _upload_jsonl_line(blob_name: str, record: dict):
+def upload_jsonl(blob_name, record):
     bucket = storage_client.bucket(BUCKET_NAME)
     blob = bucket.blob(blob_name)
     line = json.dumps(record, ensure_ascii=False) + "\n"
     blob.upload_from_string(line, content_type="application/x-ndjson")
 
 
-def _blob_exists(blob_name: str) -> bool:
+def blob_exists(blob_name):
     bucket = storage_client.bucket(BUCKET_NAME)
     return bucket.blob(blob_name).exists()
 
 
-def _safe_int(x):
-    try:
-        if x is None or x == "":
-            return None
-        return int(str(x).replace(",", "").strip())
-    except Exception:
-        return None
-
-
-# -------------------- LLM CALL --------------------
-def _vertex_extract_fields(raw_text: str) -> dict:
-    model = _get_vertex_model()
+# -------------------- LLM EXTRACTION --------------------
+def extract_fields(text: str) -> dict:
+    model = get_model()
 
     schema = {
         "type": "object",
@@ -132,7 +105,7 @@ def _vertex_extract_fields(raw_text: str) -> dict:
             "transmission": {"type": "string", "nullable": True},
             "fuel": {"type": "string", "nullable": True},
 
-            # ✅ NEW FIELDS
+            # NEW FIELDS
             "color": {"type": "string", "nullable": True},
             "city": {"type": "string", "nullable": True},
             "state": {"type": "string", "nullable": True},
@@ -140,101 +113,121 @@ def _vertex_extract_fields(raw_text: str) -> dict:
         }
     }
 
-    # ✅ UPDATED PROMPT
-    sys_instr = (
-        "Extract structured data from the listing text.\n"
-        "Return ONLY valid JSON matching the schema.\n\n"
+    prompt = f"""
+You are an information extraction system.
 
-        "Fields to extract:\n"
-        "- price (USD integer)\n"
-        "- year (integer)\n"
-        "- make (string)\n"
-        "- model (string)\n"
-        "- mileage (integer, miles)\n"
-        "- transmission (automatic/manual)\n"
-        "- fuel (gas/diesel/electric/hybrid)\n"
-        "- color (vehicle color if mentioned)\n"
-        "- city (city from listing location)\n"
-        "- state (state abbreviation or full name)\n"
-        "- zip_code (if explicitly present)\n\n"
+Extract structured fields from the vehicle listing text below.
 
-        "Rules:\n"
-        "- Do NOT infer missing values\n"
-        "- Do NOT hallucinate location data\n"
-        "- Use null if not present\n"
-        "- Output JSON only"
-    )
+STRICT RULES:
+- Return ONLY valid JSON
+- Do NOT infer or guess missing values
+- Use null if a field is not explicitly present
+- Do NOT hallucinate location information
+- Do NOT add explanations or extra text
 
-    prompt = f"{sys_instr}\n\nTEXT:\n{raw_text}"
+FIELDS:
+- price (USD integer)
+- year (integer)
+- make (string)
+- model (string)
+- mileage (integer)
+- transmission (automatic/manual)
+- fuel (gas/diesel/electric/hybrid)
+- color (vehicle color if explicitly stated)
+- city (listing location city if explicitly stated)
+- state (state abbreviation or full name if explicitly stated)
+- zip_code (if explicitly stated)
 
-    gen_cfg = GenerationConfig(
+TEXT:
+{text}
+"""
+
+    config = GenerationConfig(
         temperature=0.0,
         top_p=1.0,
         response_mime_type="application/json",
         response_schema=schema,
     )
 
-    resp = model.generate_content(prompt, generation_config=gen_cfg)
-    parsed = json.loads(resp.text)
+    response = model.generate_content(prompt, generation_config=config)
 
-    # Normalize
-    parsed["price"] = _safe_int(parsed.get("price"))
-    parsed["year"] = _safe_int(parsed.get("year"))
-    parsed["mileage"] = _safe_int(parsed.get("mileage"))
+    try:
+        data = json.loads(response.text)
+    except Exception:
+        logging.error(f"Failed to parse LLM response: {response.text}")
+        raise
 
-    def norm(s):
-        return str(s).strip() if s else None
+    # Normalize numeric fields
+    def safe_int(x):
+        try:
+            return int(str(x).replace(",", "").strip()) if x is not None else None
+        except:
+            return None
 
-    parsed["make"] = norm(parsed.get("make"))
-    parsed["model"] = norm(parsed.get("model"))
+    data["price"] = safe_int(data.get("price"))
+    data["year"] = safe_int(data.get("year"))
+    data["mileage"] = safe_int(data.get("mileage"))
 
-    return parsed
+    # Normalize strings
+    def norm(x):
+        return str(x).strip() if x else None
+
+    data["make"] = norm(data.get("make"))
+    data["model"] = norm(data.get("model"))
+
+    return data
 
 
-# -------------------- HTTP ENTRY --------------------
+# -------------------- ENTRYPOINT --------------------
 def llm_extract_http(request: Request):
     logging.getLogger().setLevel(logging.INFO)
 
     if not BUCKET_NAME or not PROJECT_ID:
-        return jsonify({"ok": False, "error": "missing env"}), 500
+        return jsonify({"ok": False, "error": "missing env vars"}), 500
 
     body = request.get_json(silent=True) or {}
     run_id = body.get("run_id")
 
     if not run_id:
-        runs = _list_structured_run_ids(BUCKET_NAME, STRUCTURED_PREFIX)
+        runs = list_run_ids()
         if not runs:
             return jsonify({"ok": False, "error": "no runs found"}), 200
         run_id = runs[-1]
 
-    structured_iso = _normalize_run_id_iso(run_id)
+    logging.info(f"Using run_id: {run_id}")
 
-    inputs = _list_per_listing_jsonl_for_run(BUCKET_NAME, run_id)
+    inputs = list_inputs(run_id)
+
     processed = written = skipped = errors = 0
 
     for in_key in inputs:
         processed += 1
-        try:
-            raw_line = _download_text(in_key).strip()
-            base_rec = json.loads(raw_line)
 
-            post_id = base_rec["post_id"]
-            source_txt_key = base_rec["source_txt"]
+        try:
+            raw_line = download_text(in_key).strip()
+            base = json.loads(raw_line)
+
+            post_id = base["post_id"]
+            source_txt = base["source_txt"]
 
             out_key = in_key.rsplit("/", 2)[0] + f"/jsonl_llm/{post_id}_llm.jsonl"
 
-            if _blob_exists(out_key):
+            # Overwrite control
+            if blob_exists(out_key) and not OVERWRITE:
                 skipped += 1
                 continue
 
-            raw_listing = _download_text(source_txt_key)
-            parsed = _vertex_extract_fields(raw_listing)
+            raw_text = download_text(source_txt)
 
-            out_record = {
+            parsed = extract_fields(raw_text)
+
+            logging.info(f"LLM output for {post_id}: {parsed}")
+
+            record = {
                 "post_id": post_id,
-                "run_id": base_rec.get("run_id", run_id),
-                "scraped_at": base_rec.get("scraped_at", structured_iso),
-                "source_txt": source_txt_key,
+                "run_id": base.get("run_id", run_id),
+                "scraped_at": base.get("scraped_at"),
+                "source_txt": source_txt,
 
                 "price": parsed.get("price"),
                 "year": parsed.get("year"),
@@ -244,23 +237,23 @@ def llm_extract_http(request: Request):
                 "transmission": parsed.get("transmission"),
                 "fuel": parsed.get("fuel"),
 
-                # ✅ NEW FIELDS
+                # NEW FIELDS
                 "color": parsed.get("color"),
                 "city": parsed.get("city"),
                 "state": parsed.get("state"),
                 "zip_code": parsed.get("zip_code"),
 
-                "llm_provider": "vertex",
                 "llm_model": LLM_MODEL,
                 "llm_ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             }
 
-            _upload_jsonl_line(out_key, out_record)
+            upload_jsonl(out_key, record)
             written += 1
 
         except Exception as e:
             errors += 1
-            logging.error(f"Error processing {in_key}: {e}\n{traceback.format_exc()}")
+            logging.error(f"Error processing {in_key}: {e}")
+            logging.error(traceback.format_exc())
 
     return jsonify({
         "ok": True,
